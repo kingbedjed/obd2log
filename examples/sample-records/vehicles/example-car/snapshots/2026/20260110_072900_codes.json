@@ -1,0 +1,14 @@
+{
+  "kind": "codes",
+  "taken": "2026-01-10T07:29:00-05:00",
+  "source": "synthetic example",
+  "mil_on": false,
+  "status_dtc_count": 0,
+  "readiness": {
+    "misfire_monitoring": "complete"
+  },
+  "stored": [],
+  "pending": [],
+  "permanent": [],
+  "freeze_frame": {}
+}

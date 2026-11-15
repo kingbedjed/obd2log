@@ -1,0 +1,21 @@
+[project]
+name = "obd2log"
+version = "0.3.0"
+description = "Read-only OBD-II logger with per-vehicle case records and PDF reports"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["obd==0.7.3"]
+
+[project.optional-dependencies]
+report = ["matplotlib", "markdown", "pypdf"]
+dev = ["pytest"]
+
+[project.scripts]
+obd2log = "obd2log.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
