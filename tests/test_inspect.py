@@ -110,7 +110,18 @@ class FakeCar:
             supported_commands=[obd.commands[n] for n in ("STATUS", "RPM", "ENGINE_LOAD")])
 
     def ask(self, cmd, force=False):
+        if isinstance(cmd, str):
+            cmd = self.custom.get(cmd) or obd.commands[cmd]
         return self.answers.get(cmd.name, resp())
+
+    def query(self, cmd, force=False):
+        return self.ask(cmd, force).value
+
+    def supports(self, name):
+        return name in self.answers
+
+    def close(self):
+        pass
 
     def request(self, header, service, pid):
         self.sent.append((header, service, pid))
@@ -134,7 +145,8 @@ def test_inspection_reports_every_attempt_including_failures():
     car = FakeCar()
     data = inspection.run(car, [(ss, {"repo": "OBDb/Test", "commit": "abc", "url": None})])
     md = inspection.render(data)
-    make = {a["label"]: a for a in data["attempts"] if a["group"] == "make"}
+    att = data["phases"][0]["attempts"]
+    make = {a["label"]: a for a in att if a["group"] == "make"}
     assert make["Battery age"]["value"] == 1825
     assert make["CHT"]["status"] == "negative response" and "7F 22 31" in make["CHT"]["detail"]
     assert make["Silent"]["status"] == "no response"
@@ -142,7 +154,7 @@ def test_inspection_reports_every_attempt_including_failures():
     assert ("7E0", "21", "01") not in car.sent
     for label in ("Battery age", "CHT", "Silent", "Mode21"):
         assert label in md
-    std = {a["name"]: a for a in data["attempts"] if "name" in a}
+    std = {a["name"]: a for a in att if "name" in a}
     assert std["OIL_TEMP"]["status"] == "negative response"
     assert std["WARMUPS_SINCE_DTC_CLEAR"]["status"] == "no response"
     assert "Warm-ups since codes cleared" in md and "no response" in md

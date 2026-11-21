@@ -154,11 +154,13 @@ def _monitor_records(car):
     return out
 
 
-def make_specific(car, spec, year, all_years=False):
+def make_specific(car, spec, year, all_years=False, tick=None):
     """Send every request in an OBDb signalset; one record per signal (or per request when nothing decodes)."""
     signalset, source = spec
     recs = []
     for req in obdb.plan(signalset, year, cli.READ_ONLY_MODES, all_years, source):
+        if tick and not req["skip"]:
+            tick()
         base = {"group": "make", "source": req["source"], "header": req["header"], "rax": req["rax"],
                 "request": f"{req['service']} {req['pid']}", "debug": req["debug"], "raw": [], "reply_from": []}
         sigs = req["signals"]
@@ -202,32 +204,61 @@ def model_year(vin, today=None):
     return y
 
 
-def run(car, specs=(), year=None, all_years=False, spec_errors=()):
-    """The whole inspection as a dict (see render())."""
+def new_report(car, specs=(), year=None, spec_errors=()):
+    """Report header; phases (full reads) and the drive are added to it."""
     vin = car.vin
-    data = {"kind": "inspect", "taken": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+    return {"kind": "inspect", "taken": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
             "source": "obd2log live read", "vin_masked": cli._mask_vin(vin), "model_year": year or model_year(vin),
-            "year_from": "--year" if year else "VIN position 10",
+            "year_from": "--year" if year else ("VIN position 10" if vin else "unknown (no VIN)"),
             "port": car.conn.port_name(), "protocol": f"{car.conn.protocol_name()} ({car.conn.protocol_id()})",
-            "_vin": vin, "signalsets": [s[1] for s in specs], "signalset_errors": list(spec_errors), "attempts": []}
-    if not vin:
-        data["year_from"] = "--year" if year else "unknown (no VIN)"
-    att = data["attempts"]
-    att.append({"group": "identity", "name": "VIN17", "label": "VIN (masked)", "request": "09 02",
-                "status": "ok" if vin else "no response", "value": cli._mask_vin(vin),
-                "detail": "" if vin else "no VIN reply", "raw": []})
-    for group, name, label, unit in STANDARD:
-        att.append(attempt(car, group, name, label, unit))
-    att += _monitor_records(car)
+            "_vin": vin, "signalsets": [s[1] for s in specs], "signalset_errors": list(spec_errors),
+            "phases": [], "drive": None}
+
+
+def _other_mode01(car):
     done = {n for _, n, _, _ in STANDARD}
-    for cmd in sorted(car.conn.supported_commands, key=lambda c: c.command):
-        if cmd.mode == 1 and cmd.name not in done and cmd.name not in cli.NOT_READINGS:
-            att.append(attempt(car, "other", cmd.name, cmd.desc))
-    data["not_requested"] = sorted(
-        c.name for c in car.obd.commands[1]
-        if c and not c.name.startswith("PIDS_") and c.name not in done and not car.conn.supports(c))
+    return [c for c in sorted(car.conn.supported_commands, key=lambda c: c.command)
+            if c.mode == 1 and c.name not in done and c.name not in cli.NOT_READINGS]
+
+
+def count_requests(car, specs, year, all_years=False):
+    """How many requests a full read sends (for progress and time estimates)."""
+    n = len(STANDARD) + len(_other_mode01(car))
+    n += sum(1 for c in car.conn.supported_commands if c.mode == 6 and not c.name.startswith("MIDS"))
+    for ss, src in specs:
+        n += sum(1 for r in obdb.plan(ss, year, cli.READ_ONLY_MODES, all_years, src) if not r["skip"])
+    return n
+
+
+def read_phase(car, name, specs=(), year=None, all_years=False, tick=None):
+    """One full read: every standard request, mode 06, other mode 01, and the OBDb requests."""
+    tick = tick or (lambda: None)
+    vin = car.vin
+    att = [{"group": "identity", "name": "VIN17", "label": "VIN (masked)", "request": "09 02",
+            "status": "ok" if vin else "no response", "value": cli._mask_vin(vin),
+            "detail": "" if vin else "no VIN reply", "raw": []}]
+    for group, cname, label, unit in STANDARD:
+        att.append(attempt(car, group, cname, label, unit))
+        tick()
+    for rec in _monitor_records(car):
+        att.append(rec)
+        tick()
+    for cmd in _other_mode01(car):
+        att.append(attempt(car, "other", cmd.name, cmd.desc))
+        tick()
+    done = {n for _, n, _, _ in STANDARD}
+    not_req = sorted(c.name for c in car.obd.commands[1]
+                     if c and not c.name.startswith("PIDS_") and c.name not in done and not car.conn.supports(c))
     for spec in specs:
-        att += make_specific(car, spec, data["model_year"], all_years)
+        att += make_specific(car, spec, year, all_years, tick)
+    return {"name": name, "taken": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "attempts": att, "not_requested": not_req}
+
+
+def run(car, specs=(), year=None, all_years=False, spec_errors=(), tick=None):
+    """A single full read (`inspect --once`) as a report dict (see render())."""
+    data = new_report(car, specs, year, spec_errors)
+    data["phases"].append(read_phase(car, "Single read", specs, data["model_year"], all_years, tick))
     data["findings"] = findings(data)
     return data
 
@@ -248,26 +279,27 @@ def _ok(data, name):
     return a.get("value") if a.get("status") == "ok" else None
 
 
-def findings(data):
-    """[(level, text)]; level is 'red flag', 'check' or 'info'."""
+def phase_findings(data, first=True):
+    """[(level, text, key)] for one full read; level is 'red flag', 'check' or 'info'.
+    key identifies the finding so the same one from a later read isn't repeated."""
     out = []
-    add = lambda lvl, txt: out.append((lvl, txt))
+    add = lambda lvl, txt, key=None: out.append((lvl, txt, key or txt))
     st = _ok(data, "STATUS")
     if st is None:
-        add("check", "Couldn't read the check-engine status or readiness monitors (01 01): see the table.")
+        add("check", "Couldn't read the check-engine status or readiness monitors (01 01): see the table.", "status")
     else:
         if st["mil_on"]:
-            add("red flag", "Check-engine light is ON.")
+            add("red flag", "Check-engine light is ON.", "mil")
         inc = [k for k, v in st["monitors"].items() if v == "incomplete"]
         if len(inc) >= 2:
             add("red flag", f"{len(inc)} readiness monitors incomplete ({', '.join(inc)}). Typical right after "
                 "codes are cleared or the battery is disconnected; they need days of mixed driving to finish. "
-                "Ask when and why. Most states won't pass an emissions test like this.")
+                "Ask when and why. Most states won't pass an emissions test like this.", "readiness")
         elif inc:
             add("check", f"1 readiness monitor incomplete ({inc[0]}). EVAP and catalyst are often the last to "
-                "finish; one alone is common, but ask.")
+                "finish; one alone is common, but ask.", "readiness")
         else:
-            add("info", "All readiness monitors the car has are complete.")
+            add("info", "All readiness monitors the car has are complete.", "readiness")
     codes = {k: _ok(data, k) for k in ("GET_DTC", "GET_CURRENT_DTC", "PERMANENT_DTC")}
     for k, label in (("GET_DTC", "Stored"), ("GET_CURRENT_DTC", "Pending"), ("PERMANENT_DTC", "Permanent")):
         if codes[k]:
@@ -287,38 +319,42 @@ def findings(data):
         recent.append(f"{t:g} min of engine running")
     if recent:
         add("red flag", "Codes were cleared recently: " + ", ".join(recent) + " ago (or the battery was "
-            "disconnected). Ask why; a cleared code often comes back within a week.")
+            "disconnected). Ask why; a cleared code often comes back within a week.", "cleared")
     elif any(x is not None for x in (d, w, t)):
         add("info", "Codes last cleared " + ", ".join(
             s for s in (d is not None and f"{d:g} km", w is not None and f"{w} warm-ups" + (" (counter max)" if w == 255 else ""),
-                        t is not None and f"{t:g} min engine time") if s) + " ago.")
+                        t is not None and f"{t:g} min engine time") if s) + " ago.", "cleared")
     else:
-        add("check", "The car didn't report when codes were last cleared (01 30/31/4E); can't rule out a recent clear.")
+        add("check", "The car didn't report when codes were last cleared (01 30/31/4E); can't rule out a recent clear.",
+            "cleared")
     mil_km = _ok(data, "DISTANCE_W_MIL")
     if mil_km:
         add("red flag" if not (st and st["mil_on"]) else "check",
             f"Driven {mil_km:g} km with the check-engine light on" +
-            (" and the light is off now: a fault was present recently." if not (st and st["mil_on"]) else "."))
+            (" and the light is off now: a fault was present recently." if not (st and st["mil_on"]) else "."), "mil_km")
 
     rpm, cool = _ok(data, "RPM"), _ok(data, "COOLANT_TEMP")
     air = [x for x in (_ok(data, "AMBIANT_AIR_TEMP"), _ok(data, "INTAKE_TEMP")) if x is not None]
     running = bool(rpm and rpm > 300)
-    if not running and cool is not None and air and cool - min(air) > 15:
+    if first and running:
+        add("check", "The engine was already running at the first read, so there was no cold-start check. "
+            "Ask the seller not to start it before you arrive.", "warm")
+    if first and not running and cool is not None and air and cool - min(air) > 15:
         add("check", f"Engine off but coolant is {cool:g} °C vs {min(air):g} °C air: the engine ran recently. "
-            "If this was your first look, it was warmed up before you arrived, which hides cold-start problems.")
+            "If this was your first look, it was warmed up before you arrived, which hides cold-start problems.", "warm")
     volts = _ok(data, "CONTROL_MODULE_VOLTAGE") or _ok(data, "ELM_VOLTAGE")
     if volts is not None:
         if not running and volts < 12.2:
-            add("check", f"{volts:g} V with the engine off: battery weak or discharged.")
+            add("check", f"{volts:g} V with the engine off: battery weak or discharged.", "volts_off")
         if running and volts < 13.2:
-            add("check", f"{volts:g} V with the engine running: charging looks low (alternator or wiring).")
+            add("check", f"{volts:g} V with the engine running: charging looks low (alternator or wiring).", "volts_on")
         if running and volts > 15.2:
-            add("check", f"{volts:g} V with the engine running: charging looks high (regulator).")
+            add("check", f"{volts:g} V with the engine running: charging looks high (regulator).", "volts_on")
     for n in ("LONG_FUEL_TRIM_1", "LONG_FUEL_TRIM_2"):
         v = _ok(data, n)
         if v is not None and abs(v) > 10 and running:
             add("check", f"{n.lower()} {v:+g} %: the engine is correcting a lot (vacuum leak, fuel delivery, "
-                "MAF sensor or injectors). Recheck when fully warm.")
+                "MAF sensor or injectors). Recheck when fully warm.", n)
     for a in data["attempts"]:
         if a["group"] == "mode06" and a["status"] == "ok":
             for t in a["value"]:
@@ -334,22 +370,67 @@ def findings(data):
            and (a.get("name") == "ODOMETER" or a.get("metric") == "odometer" or "odometer" in (a.get("label") or "").lower())]
     if odo:
         add("info", "Odometer readings: " + "; ".join(f"{l} = {v:g} km ({v / 1.609344:,.0f} mi)" for l, _, v in odo)
-            + ". Compare with the dashboard.")
+            + ". Compare with the dashboard.", "odo")
         vals = [v for *_, v in odo]
         if max(vals) - min(vals) > 50:
             add("red flag", f"Modules disagree on the odometer by {max(vals) - min(vals):g} km: possible "
-                "instrument-cluster swap or rollback (or a wrongly decoded community PID; check the raw replies).")
+                "instrument-cluster swap or rollback (or a wrongly decoded community PID; check the raw replies).",
+                "odo_mismatch")
     else:
-        add("info", "No module reported the odometer; check mileage against the title and a history report.")
+        add("info", "No module reported the odometer; check mileage against the title and a history report.", "odo")
 
     mk = [a for a in data["attempts"] if a["group"] == "make"]
     if mk:
         by = {}
         for a in mk:
             by[a["status"]] = by.get(a["status"], 0) + 1
-        add("info", "Manufacturer-specific (OBDb) signals: " + ", ".join(f"{n} {s}" for s, n in sorted(by.items())) + ".")
+        add("info", "Manufacturer-specific (OBDb) signals: " + ", ".join(f"{n} {s}" for s, n in sorted(by.items())) + ".",
+            "make")
+    return out
+
+
+def drive_findings(drive):
+    out = []
+    add = lambda lvl, txt: out.append((lvl, txt, txt))
+    if not drive or not drive.get("samples"):
+        return out
+    km, target = drive["distance_km"], drive["target_km"]
+    add("info", f"Drive: {km / 1.609344:.1f} mi ({km:.1f} km) in {drive['minutes']:.0f} min, top speed "
+        f"{drive.get('max_speed_kph') or 0:.0f} km/h" + ("" if drive["completed"] else
+        f"; ended before the planned {target / 1.609344:.1f} mi, so some checks may not have run") + ".")
+    cmax, c80 = drive.get("max_coolant_c"), drive.get("minutes_to_80c")
+    if cmax is not None:
+        if cmax > 105:
+            add("red flag", f"Coolant reached {cmax:g} °C during the drive: overheating.")
+        elif cmax < 75 and km >= 5:
+            add("check", f"Coolant only reached {cmax:g} °C after {km:.0f} km: thermostat may be stuck open.")
+        else:
+            add("info", f"Coolant peaked at {cmax:g} °C" + (f", reached 80 °C after {c80:.0f} min" if c80 else "") + ".")
+    v = drive.get("median_running_v")
+    if v is not None and (v < 13.2 or v > 15.2):
+        add("check", f"Median {v:g} V while running: charging {'low' if v < 13.2 else 'high'}.")
+    for k in ("ltft_b1_warm_median", "ltft_b2_warm_median"):
+        x = drive.get(k)
+        if x is not None and abs(x) > 10:
+            add("check", f"Warm long-term fuel trim ({k[5:7]}) median {x:+g} %: the engine is correcting a lot.")
+    for e in drive.get("code_events", []):
+        add("red flag", f"During the drive at {e['minute']:.0f} min: {e['what']}.")
+    return out
+
+
+def findings(data):
+    """[(level, text)] across every read and the drive, without repeats."""
+    out, seen = [], set()
+    multi = len(data["phases"]) > 1
+    for i, ph in enumerate(data["phases"]):
+        for lvl, txt, key in phase_findings(ph, first=(i == 0)):
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((lvl, f"[{ph['name'].split(' (')[0].lower()}] {txt}" if multi else txt))
+    out += [(lvl, txt) for lvl, txt, _ in drive_findings(data.get("drive"))]
     for e in data.get("signalset_errors", []):
-        add("check", f"Manufacturer-specific signals not read: {e}")
+        out.append(("check", f"Manufacturer-specific signals not read: {e}"))
     return out
 
 
@@ -380,37 +461,46 @@ def _show(a):
     return f"{_cell(v)} {a.get('unit') or ''}".strip()
 
 
-def render(data, show_vin=None):
-    """Markdown report. Every attempt appears with its status."""
-    A = data["attempts"]
+def _counts(rows):
+    by = {}
+    for a in rows:
+        by[a["status"]] = by.get(a["status"], 0) + 1
+    return ", ".join(f"{n} {s}" for s, n in sorted(by.items()))
+
+
+def _render_drive(d):
+    md = ["", "## Drive", ""]
+    if not d.get("samples"):
+        return md + [f"No drive logged{': ' + d['note'] if d.get('note') else ''}."]
+    mi = lambda km: f"{km / 1.609344:.1f} mi ({km:.1f} km)"
+    rows = [("distance", mi(d["distance_km"]) + f" of {mi(d['target_km'])} planned"
+             + ("" if d["completed"] else ", ended early")),
+            ("time", f"{d['minutes']:.0f} min, {d['samples']} samples"),
+            ("car's own distance counter (01 31)", f"+{d['counter_km']:g} km" if d.get("counter_km") is not None else "not reported"),
+            ("top speed", f"{d.get('max_speed_kph') or 0:.0f} km/h"),
+            ("coolant", f"{_cell(d.get('start_coolant_c'))} → max {_cell(d.get('max_coolant_c'))} °C"
+             + (f", 80 °C after {d['minutes_to_80c']:.0f} min" if d.get("minutes_to_80c") else "")),
+            ("voltage while running (median)", f"{_cell(d.get('median_running_v'))} V"),
+            ("long-term fuel trim, warm (median b1 / b2)",
+             " / ".join("n/a" if d.get(k) is None else f"{d[k]:+g} %" for k in ("ltft_b1_warm_median", "ltft_b2_warm_median"))),
+            ("codes during the drive", "; ".join(f"{e['minute']:.0f} min: {e['what']}" for e in d.get("code_events", []))
+             or "no changes")]
+    if d.get("note"):
+        rows.append(("note", d["note"]))
+    md.append(_table(["", ""], rows))
+    if d.get("figure"):
+        md += ["", f"![Drive](figures/{Path(d['figure']).name})"]
+    return md
+
+
+def _render_phase(ph, md):
+    A = ph["attempts"]
     g = lambda grp: [a for a in A if a["group"] == grp]
-    md = [f"# Vehicle inspection, {data['taken'][:16].replace('T', ' ')}", ""]
-    md.append(f"- **VIN:** {show_vin or data['vin_masked'] or 'not reported'}"
-              + ("" if show_vin else " (masked; `--show-vin` prints it on screen only)") + ". "
-              "Compare with the dash plate, door sticker and title.")
-    md.append(f"- **Model year:** {data['model_year'] or 'unknown'} (from {data['year_from']})")
-    rpm = _ok(data, "RPM")
-    md.append(f"- **Engine:** {'running, ' + _cell(rpm) + ' rpm' if rpm and rpm > 300 else 'off (ignition on)' if rpm is not None else 'unknown'}"
-              f" · link {data['protocol']} on {data['port']}")
-    for s in data["signalsets"]:
-        md.append(f"- **Manufacturer signals:** {s['repo']}" + (f" @ `{s['commit'][:12]}`" if s.get("commit") else "")
-                  + (f" ({s['url']})" if s.get("url") else "") + ", community data, CC-BY-SA-4.0, unverified on this car")
-    tot = {}
-    for a in A:
-        tot[a["status"]] = tot.get(a["status"], 0) + 1
-    md.append(f"- **Requests:** {len(A)} readings tried: " + ", ".join(f"{n} {s}" for s, n in sorted(tot.items())))
-
-    md += ["", "## Findings", "", "Heuristics for a buyer, not a diagnosis. Thresholds are rules of thumb.", ""]
-    order = {"red flag": 0, "check": 1, "info": 2}
-    md += [f"- **{lvl}:** {txt}" for lvl, txt in sorted(data["findings"], key=lambda f: order[f[0]])]
-    md += ["", "OBD can't see: mileage on most pre-2019 cars, ABS/airbag/body faults (generic OBD covers "
-           "engine and emissions), accident or flood damage, rust, brakes, suspension, leaks, or how the "
-           "transmission shifts. Get a pre-purchase inspection and a history report."]
-
-    st = _get(data, "STATUS")
-    md += ["", "## Readiness monitors (01 01)", ""]
+    md += ["", f"## {ph['name']}", "", f"Read at {ph['taken'][11:16]}. {len(A)} readings tried: {_counts(A)}."]
+    st = _get(ph, "STATUS")
+    md += ["", "### Readiness monitors (01 01)", ""]
     if st.get("status") == "ok":
-        cyc = _ok(data, "STATUS_DRIVE_CYCLE") or {"monitors": {}}
+        cyc = _ok(ph, "STATUS_DRIVE_CYCLE") or {"monitors": {}}
         md.append(_table(["monitor", "since codes cleared", "this drive cycle (01 41)"],
                          [(k, v, cyc["monitors"].get(k, "not read")) for k, v in st["value"]["monitors"].items()]))
         md.append(f"\nCheck-engine light: **{'ON' if st['value']['mil_on'] else 'off'}**, "
@@ -419,8 +509,7 @@ def render(data, show_vin=None):
         md.append(f"Not read: {st.get('status')}: {st.get('detail')}")
 
     def section(title, rows, note=None):
-        nonlocal md
-        md += ["", f"## {title}", ""] + ([note, ""] if note else [])
+        md.extend(["", f"### {title}", ""] + ([note, ""] if note else []))
         md.append(_table(["reading", "request", "status", "value", "detail"],
                          [(a["label"], a["request"], a["status"], _show(a) if a["status"] == "ok" else "", a["detail"])
                           for a in rows]) if rows else "None.")
@@ -432,8 +521,7 @@ def render(data, show_vin=None):
             "disconnected. The warm-up counter stops at 255 and distance at 65,535 km.")
     section("Live readings", g("live"))
     section("Identity", g("identity"))
-
-    md += ["", "## Mode 06 self-tests", ""]
+    md += ["", "### Mode 06 self-tests", ""]
     rows = []
     for a in g("mode06"):
         if a["status"] == "ok":
@@ -444,51 +532,89 @@ def render(data, show_vin=None):
     md.append(_table(["monitor", "TID", "test", "value", "limits", "result"], rows) if rows
               else "The car listed no mode 06 monitors.")
     md.append("\nMisfire TIDs 0B = average of the last ten drive cycles, 0C = this or the last cycle.")
-
     section("Other standard readings (every other mode 01 PID the car supports)", g("other"))
-    if data.get("not_requested"):
+    if ph.get("not_requested"):
         md += ["", "Not requested (the car's supported-PID list says it doesn't have them): "
-               + ", ".join(n.lower() for n in data["not_requested"]) + "."]
-
+               + ", ".join(n.lower() for n in ph["not_requested"]) + "."]
     mk = g("make")
-    if mk or data.get("signalset_errors"):
-        md += ["", "## Manufacturer-specific (OBDb)", "",
-               "Community-sourced requests and scalings, unverified on this car. The raw reply is in "
-               "report.json for every request. `debug` = OBDb marks the request as still being worked out."]
-        for e in data.get("signalset_errors", []):
-            md.append(f"\n**Not read:** {e}")
-        for src in dict.fromkeys(a["source"] for a in mk):
-            rows = [a for a in mk if a["source"] == src]
-            by = {}
-            for a in rows:
-                by[a["status"]] = by.get(a["status"], 0) + 1
-            md += ["", f"### {src}", "", ", ".join(f"{n} {s}" for s, n in sorted(by.items())), ""]
-            md.append(_table(["group", "signal", "module → request", "status", "value", "detail"],
-                             [(a["path"], a["label"] + (" (debug)" if a["debug"] else ""),
-                               f"{a['header']} → {a['request']}", a["status"],
-                               f"{_cell(a['value'])} {a['unit']}".strip() if a["status"] == "ok" else "",
-                               a["detail"]) for a in rows]))
+    for src in dict.fromkeys(a["source"] for a in mk):
+        rows = [a for a in mk if a["source"] == src]
+        md += ["", f"### Manufacturer-specific: {src}", "",
+               "Community-sourced requests and scalings (OBDb), unverified on this car; raw replies are in "
+               "report.json. `debug` = OBDb marks the request as still being worked out.", "", _counts(rows), ""]
+        md.append(_table(["group", "signal", "module → request", "status", "value", "detail"],
+                         [(a["path"], a["label"] + (" (debug)" if a["debug"] else ""),
+                           f"{a['header']} → {a['request']}", a["status"],
+                           f"{_cell(a['value'])} {a['unit']}".strip() if a["status"] == "ok" else "",
+                           a["detail"]) for a in rows]))
+
+
+def render(data, show_vin=None):
+    """Markdown report. Every attempt in every read appears with its status."""
+    md = [f"# Vehicle inspection, {data['taken'][:16].replace('T', ' ')}", ""]
+    md.append(f"- **VIN:** {show_vin or data['vin_masked'] or 'not reported'}"
+              + ("" if show_vin else " (masked; `--show-vin` prints it on screen only)") + ". "
+              "Compare with the dash plate, door sticker and title.")
+    md.append(f"- **Model year:** {data['model_year'] or 'unknown'} (from {data['year_from']})")
+    md.append(f"- **Link:** {data['protocol']} on {data['port']}")
+    for s in data["signalsets"]:
+        md.append(f"- **Manufacturer signals:** {s['repo']}" + (f" @ `{s['commit'][:12]}`" if s.get("commit") else "")
+                  + (f" ({s['url']})" if s.get("url") else "") + ", community data, CC-BY-SA-4.0, unverified on this car")
+    if not data["signalsets"]:
+        md.append("- **Manufacturer signals:** none. This is a generic OBD-II report"
+                  + (": " + "; ".join(data["signalset_errors"]) if data["signalset_errors"] else
+                     " (no --make/--model given)") + ".")
+    for ph in data["phases"]:
+        rpm = _ok(ph, "RPM")
+        eng = f"engine running, {_cell(rpm)} rpm" if rpm and rpm > 300 else "engine off" if rpm is not None else "engine state unknown"
+        md.append(f"- **{ph['name']}:** {ph['taken'][11:16]}, {eng}, {len(ph['attempts'])} readings: {_counts(ph['attempts'])}")
+
+    md += ["", "## Findings", "", "Heuristics for a buyer, not a diagnosis. Thresholds are rules of thumb.", ""]
+    order = {"red flag": 0, "check": 1, "info": 2}
+    md += [f"- **{lvl}:** {txt}" for lvl, txt in sorted(data["findings"], key=lambda f: order[f[0]])]
+    md += ["", "OBD can't see: mileage on most pre-2019 cars, ABS/airbag/body faults (generic OBD covers "
+           "engine and emissions), accident or flood damage, rust, brakes, suspension, leaks, or how the "
+           "transmission shifts. Get a pre-purchase inspection and a history report."]
+    if data.get("drive") is not None:
+        md += _render_drive(data["drive"])
+    for ph in data["phases"]:
+        _render_phase(ph, md)
     md += ["", "---", "", "Read-only: only services 01, 02, 03, 06, 07, 09, 0A and 22 were sent. Nothing was "
            "cleared, written or actuated."]
     return "\n".join(md) + "\n"
 
 
+def report_dir(data):
+    """inspections/<YYYY>/<stamp>_inspect/ under the car's vehicle folder (or unassigned/)."""
+    d = records.stamped_dir(cli._data_dir(data.get("_vin")), "inspections") \
+        / f"{dt.datetime.now():%Y%m%d_%H%M%S}_inspect"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def save(data, md, out=None, pdf=True):
-    """Write report.md, report.json (and report.pdf) to `out` or the vehicle's inspections/<YYYY>/<stamp>_inspect/."""
-    if out:
-        d = Path(out)
-    else:
-        d = records.stamped_dir(cli._data_dir(data.get("_vin")), "inspections") \
-            / f"{dt.datetime.now():%Y%m%d_%H%M%S}_inspect"
+    """Write report.md, report.json and report.pdf (drive log and JSON attached) to `out`
+    (default: a new report_dir). Returns the files written."""
+    d = Path(out) if out else report_dir(data)
     d.mkdir(parents=True, exist_ok=True)
     (d / "report.md").write_text(md)
     (d / "report.json").write_text(json.dumps({k: v for k, v in data.items() if not k.startswith("_")},
                                               indent=2, default=str) + "\n")
     made = [d / "report.md", d / "report.json"]
+    log = (data.get("drive") or {}).get("log")
+    if log and Path(log).exists():
+        made.append(Path(log))
     if pdf:
         from . import report
         try:
-            made.append(report.markdown_pdf(md, d / "report.pdf", "Vehicle inspection"))
+            pdf_path = report.markdown_pdf(md, d / "report.pdf", "Vehicle inspection")
+            from pypdf import PdfReader, PdfWriter
+            w = PdfWriter(clone_from=PdfReader(pdf_path))
+            for f in made[1:]:
+                w.add_attachment(Path(f).name, Path(f).read_bytes())
+            with open(pdf_path, "wb") as fh:
+                w.write(fh)
+            made.append(pdf_path)
         except Exception as e:  # noqa: BLE001
             print(f"PDF not made: {e}")
     return made

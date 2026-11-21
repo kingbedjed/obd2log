@@ -763,6 +763,13 @@ def _signalsets(args):
 def cmd_inspect(args):
     from . import inspection
     specs, errors = _signalsets(args)   # fetch before connecting: the network may be gone at the car
+    if not args.once:
+        from . import guided
+        guided.run_guided(guided.default_connect(_port(args)), guided.IO(speak=not args.quiet), specs, errors,
+                          args.year, args.all_years, args.drive_miles * guided.MI,
+                          None if args.save in (None, "-") else args.save, pdf=not args.no_pdf,
+                          show_vin=args.show_vin)
+        return
     car = _connect_or_exit(args)
     print("reading everything the car will report; this takes a minute or two...")
     try:
@@ -809,7 +816,7 @@ def main():
     s = sub.add_parser("monitors", help="mode 06 self-test results (misfire counts per cylinder, etc.)")
     s.add_argument("--save", help=save_help)
     s.set_defaults(fn=cmd_monitors)
-    s = sub.add_parser("inspect", help="used-car check: read everything (standard + --make/--model) into a report")
+    s = sub.add_parser("inspect", help="guided used-car check: read, test drive, read again -> report + PDF")
     s.add_argument("--make", help="e.g. ford: adds OBDb manufacturer-specific requests")
     s.add_argument("--model", help="e.g. escape: uses the OBDb <Make>-<Model> signalset (else the make-wide one)")
     s.add_argument("--year", type=int, help="model year for OBDb year filters (default: from the VIN)")
@@ -821,6 +828,10 @@ def main():
     s.add_argument("--show-vin", action="store_true", help="print the full VIN on screen (files stay masked)")
     s.add_argument("--save", help="report directory; default: the vehicle's inspections/<YYYY>/<stamp>_inspect/; '-' = don't save")
     s.add_argument("--no-pdf", action="store_true", help="skip report.pdf")
+    s.add_argument("--once", action="store_true",
+                   help="a single read and report, no waiting or drive (default: guided read, drive, read)")
+    s.add_argument("--drive-miles", type=float, default=5.0, help="planned test-drive distance (default 5)")
+    s.add_argument("--quiet", action="store_true", help="don't speak prompts (spd-say)")
     s.set_defaults(fn=cmd_inspect)
     s = sub.add_parser("pids", help="OBDb manufacturer-specific signalsets (github.com/OBDb)")
     ps = s.add_subparsers(dest="pcmd", required=True)

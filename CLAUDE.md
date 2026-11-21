@@ -28,8 +28,11 @@ manual images or user paths. Those live in the user's records repo (path in
 - `src/obd2log/records.py`: config, vehicle-by-VIN-hash, case date windows
 - `src/obd2log/report.py`: figures, HTML→PDF (Chrome headless), PDF
   attachments (pypdf), rclone upload
-- `src/obd2log/inspection.py`: `inspect` (standard + OBDb requests, buyer
-  findings, markdown report)
+- `src/obd2log/inspection.py`: full reads (standard + OBDb requests), buyer
+  findings, markdown/PDF report
+- `src/obd2log/guided.py`: the guided `inspect` session (wait for car, read,
+  prompted drive with distance tracking, read, report); `IO` is the seam tests
+  replace
 - `src/obd2log/obdb.py`: OBDb fetch/cache, request planning (skip reasons),
   signal decoding (port of OBDb/.schemas python/can/signals.py)
 - `autostart/`: udev + systemd user unit generator

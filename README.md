@@ -84,45 +84,61 @@ obd2log pids search <text>         # find OBDb repos, e.g. `pids search escape`
 
 ### Used-car inspection
 
-`obd2log inspect` makes one read-only pass over everything the car reports and
-writes `report.md`, `report.json` (with raw replies) and `report.pdf` to the
-vehicle's `inspections/<YYYY>/<stamp>_inspect/` (or `unassigned/` for a car
-with no profile, e.g. one you're looking at).
+At home, while online, cache the manufacturer codes for the car you're going
+to see:
 
-- Standard OBD-II: check-engine status, readiness monitors (since codes were
-  cleared and this drive cycle), stored / pending / permanent codes, freeze
-  frame, distance / warm-ups / engine time since codes were cleared, distance
-  with the light on, odometer (01 A6, mostly 2019+), live readings, mode 06
-  self-tests, and every other mode 01 PID the car supports.
-- `--make ford --model escape`: every request in the matching
-  [OBDb](https://github.com/OBDb) signalset (community data, CC-BY-SA-4.0),
+```sh
+obd2log pids fetch ford escape
+```
+
+At the car, start the session (the adapter can be plugged in or not, the
+ignition on or off):
+
+```sh
+obd2log inspect --make ford --model escape        # --drive-miles 5 (default), --quiet: no speech
+```
+
+1. It waits for the adapter and the ignition, and says which one is missing.
+2. With the ignition on (ideally before the engine has been started), it reads
+   everything the car reports, showing progress and time left.
+3. It tells you to start the engine and drive. It logs the drive, tracks the
+   distance from vehicle speed, watches for new codes or the check-engine
+   light, says when you're halfway, and says when the drive is done (distance
+   reached and engine fully warm).
+4. Drive back and press Enter with the engine running. It reads everything
+   again, prints the report and saves it.
+
+Prompts are printed and spoken with `spd-say` when it's installed. If the codes
+for `--make/--model` aren't cached, it downloads them; with no internet it
+warns you and makes a generic OBD-II report. `--once` does a single read with
+no waiting or drive.
+
+The report goes to the vehicle's `inspections/<YYYY>/<stamp>_inspect/` (or
+`unassigned/` for a car with no profile): `report.md`, `report.json` (every
+request with its raw reply), `drive.csv.gz`, and `report.pdf` with a drive
+chart and the JSON and drive log attached.
+
+- **Standard OBD-II, in each read:** check-engine status, readiness monitors
+  (since codes were cleared and this drive cycle), stored / pending /
+  permanent codes, freeze frame, distance / warm-ups / engine time since codes
+  were cleared, distance with the light on, odometer (01 A6, mostly 2019+),
+  live readings, mode 06 self-tests, and every other mode 01 PID the car
+  supports.
+- **Manufacturer-specific:** every request in the matching
+  [OBDb](https://github.com/OBDb) signalset (community data, CC-BY-SA-4.0)
   for the model year from the VIN (or `--year`). `--make` alone uses the
-  make-wide set; `--make-wide` adds it to a model set. Signalsets are cached
-  in `~/.cache/obd2log/obdb/`, so fetch them before going somewhere with no
-  network.
+  make-wide set; `--make-wide` adds it to a model set.
 - **Every request is listed with its outcome:** ok, no response, negative
   response (with the module's reason, e.g. `7F 22 31` = PID not supported),
   not decodable, error, or not sent (with the reason: outside the read-only
   allowlist, 29-bit or extended addressing, needs a diagnostic session, or a
   different model year).
-- A findings section flags the usual buyer gotchas: recently cleared codes,
+- **Findings** flag the usual buyer gotchas: recently cleared codes,
   incomplete monitors, permanent codes, distance driven with the light on, an
   engine warmed up before you arrived, charging voltage, fuel trims, failed
-  self-tests and misfires, and odometer readings from each module that
-  reports one. These are rules of thumb, not diagnoses.
-
-Run it twice if you can: key on, engine off, cold (before the seller starts
-it), then again after the test drive with the engine running.
-
-`check`, `codes` and `monitors` save a JSON snapshot to the vehicle by default
-(`--save -` to skip). If a link fails, `check` says whether the adapter is
-missing, has no power from the car, or the ECU isn't answering.
-
-### Autostart logging (Linux, systemd)
-
-With the adapter plugged in: `autostart/install.sh` (needs sudo for the udev
-rule). Plugging the adapter in starts `obd2log log --auto`, and unplugging it stops the
-service. The laptop must stay awake. `autostart/uninstall.sh` removes it.
+  self-tests and misfires, odometer readings from each module, and from the
+  drive: overheating, a thermostat that never warms up, and codes that
+  appeared while driving. These are rules of thumb, not diagnoses.
 
 ## Manufacturer-specific readings
 
