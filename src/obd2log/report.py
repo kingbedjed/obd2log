@@ -215,13 +215,11 @@ def build(case):
             f"</title><style>{CSS}</style></head><body>{''.join(parts)}</body></html>")
     (out / "report.html").write_text(page)
 
-    chrome = shutil.which("google-chrome") or shutil.which("chromium")
-    if not chrome:
-        sys.exit(f"wrote {out / 'report.html'}; no Chrome/Chromium found for the PDF")
     pdf = out / "report.pdf"
-    subprocess.run([chrome, "--headless", "--disable-gpu", "--no-pdf-header-footer",
-                    f"--print-to-pdf={pdf}", (out / "report.html").as_uri()],
-                   check=True, capture_output=True)
+    try:
+        html_pdf(out / "report.html", pdf)
+    except FileNotFoundError as e:
+        sys.exit(f"wrote {out / 'report.html'}; {e}")
 
     from pypdf import PdfReader, PdfWriter
     w = PdfWriter(clone_from=PdfReader(pdf))
@@ -231,6 +229,28 @@ def build(case):
         w.write(fh)
     print(f"report: {pdf}  ({len(logs)} logs, {len(snaps)} snapshots attached)")
     return pdf
+
+
+def html_pdf(html_path, pdf):
+    """Print an HTML file to PDF with headless Chrome/Chromium."""
+    chrome = shutil.which("google-chrome") or shutil.which("chromium")
+    if not chrome:
+        raise FileNotFoundError("no Chrome/Chromium found for the PDF")
+    subprocess.run([chrome, "--headless", "--disable-gpu", "--no-pdf-header-footer",
+                    f"--print-to-pdf={pdf}", Path(html_path).resolve().as_uri()],
+                   check=True, capture_output=True)
+    return pdf
+
+
+def markdown_pdf(md_text, pdf, title):
+    """Markdown -> HTML (kept next to the PDF) -> PDF, in the case-report style."""
+    import markdown
+    body = markdown.markdown(md_text, extensions=["tables"])
+    page = (f"<!doctype html><html><head><meta charset=utf-8><title>{html.escape(title)}</title>"
+            f"<style>{CSS}</style></head><body>{body}</body></html>")
+    h = Path(pdf).with_suffix(".html")
+    h.write_text(page)
+    return html_pdf(h, pdf)
 
 
 def upload(path=None, remote=None):

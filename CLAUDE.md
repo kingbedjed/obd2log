@@ -13,6 +13,12 @@ manual images or user paths. Those live in the user's records repo (path in
   pins this.
 - **Don't guess manufacturer PIDs.** A mode-22 PID needs a cited source for
   its address *and* scaling; otherwise log raw and label it unverified.
+  OBDb signalsets (fetched at a pinned commit, never vendored: CC-BY-SA) are
+  the source for `inspect`; its values are labelled community-sourced, with
+  the raw reply kept.
+- **Report every attempt.** `inspect` lists every request with its outcome,
+  including no response, negative responses and "not sent" with the reason.
+  Don't drop failed or skipped requests from output.
 - VINs: display masked (first 11 + ******); store only sha256 for matching.
 
 ## Layout
@@ -22,6 +28,10 @@ manual images or user paths. Those live in the user's records repo (path in
 - `src/obd2log/records.py`: config, vehicle-by-VIN-hash, case date windows
 - `src/obd2log/report.py`: figures, HTML→PDF (Chrome headless), PDF
   attachments (pypdf), rclone upload
+- `src/obd2log/inspection.py`: `inspect` (standard + OBDb requests, buyer
+  findings, markdown report)
+- `src/obd2log/obdb.py`: OBDb fetch/cache, request planning (skip reasons),
+  signal decoding (port of OBDb/.schemas python/can/signals.py)
 - `autostart/`: udev + systemd user unit generator
 - `examples/sample-records/`: synthetic records for trying `report`
 

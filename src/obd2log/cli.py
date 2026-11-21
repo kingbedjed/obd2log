@@ -108,7 +108,18 @@ def _make_custom_commands(obd):
         text = bytes(c for c in d[i + 2:] if 0x30 <= c <= 0x5A) if i >= 0 else b""
         return text[-17:].decode() if len(text) >= 17 else None
 
+    def decode_ecu_name(messages):
+        d = b"".join(bytes(m.data) for m in messages)
+        i = d.find(b"\x49\x0a")
+        return bytes(c for c in d[i + 3:] if 0x20 <= c < 0x7F).decode().strip() or None if i >= 0 else None
+
+    def decode_odometer(messages):
+        d = bytes(messages[0].data)
+        return int.from_bytes(d[2:6], "big") / 10 if len(d) >= 6 and d[:2] == b"\x41\xa6" else None
+
     cmds = {
+        "ECU_NAME": OBDCommand("ECU_NAME", "ECU name", b"090A", 0, decode_ecu_name, ECU.ALL, False),
+        "ODOMETER": OBDCommand("ODOMETER", "Odometer (km)", b"01A6", 0, decode_odometer, ECU.ENGINE, False),
         "VIN17": OBDCommand("VIN17", "VIN", b"0902", 0, decode_vin, ECU.ENGINE, False),
         "FORD_CHT_RAW": OBDCommand("FORD_CHT_RAW", "Ford CHT raw (22 1624)", CHT_REQUEST,
                                    5, decode_cht, ECU.ENGINE, False, header=b"7E0"),
@@ -119,6 +130,16 @@ def _make_custom_commands(obd):
         cmds[name] = OBDCommand(name, name, b"02%02X00" % pid, nbytes, freeze(pid, fn),
                                 ECU.ENGINE, False)
     return cmds
+
+
+def can_id(message):
+    """The CAN id a python-OBD message came from, from the ELM's header line (e.g. '7E8')."""
+    raw = message.frames[0].raw if message.frames else ""
+    tok = raw.split()
+    if len(tok) > 1 and len(tok[0]) in (3, 8):
+        return tok[0].upper()
+    raw = raw.replace(" ", "")
+    return raw[:3].upper() or None
 
 
 def _dtc_str(b):
@@ -140,7 +161,8 @@ class ReadOnlyCar:
     def connected(self):
         return self.conn.is_connected()
 
-    def query(self, cmd, force=False):
+    def ask(self, cmd, force=False):
+        """The full python-OBD response (value and raw messages). Every request goes through here."""
         if isinstance(cmd, str):
             cmd = self.custom.get(cmd) or self.obd.commands[cmd]
         raw = cmd.command
@@ -148,8 +170,21 @@ class ReadOnlyCar:
             mode = raw[:2].decode().upper()
             if mode not in READ_ONLY_MODES:
                 raise PermissionError(f"refusing mode {mode} ({cmd.name}): not read-only")
-        r = self.conn.query(cmd, force=force)
+        return self.conn.query(cmd, force=force)
+
+    def query(self, cmd, force=False):
+        r = self.ask(cmd, force=force)
         return None if r.is_null() else r.value
+
+    def request(self, header, service, pid):
+        """Send one read request to the module at `header` (11-bit CAN, hex) and return every
+        reply as (CAN id, payload starting at the service byte). Goes through the same guard."""
+        from obd import OBDCommand
+        from obd.protocols import ECU
+        cmd = OBDCommand(f"RAW_{header}_{service}{pid}", f"{header} {service} {pid}",
+                         (service + pid).upper().encode(), 0, lambda m: m, ECU.ALL, False,
+                         header=header.upper().encode())
+        return [(can_id(m), bytes(m.data)) for m in self.ask(cmd, force=True).messages]
 
     def supports(self, name):
         return self.conn.supports(self.obd.commands[name])
@@ -196,7 +231,7 @@ def _readiness(st):
     """Readiness monitors from mode 01 PID 01: {name: 'complete'|'incomplete'} for available ones."""
     out = {}
     for name, test in vars(st).items():
-        if hasattr(test, "available") and test.available:
+        if isinstance(name, str) and hasattr(test, "available") and test.available:
             out[name.lower()] = "complete" if test.complete else "incomplete"
     return out
 
@@ -688,6 +723,77 @@ exclude:
     print(f"created {d}/case.md")
 
 
+# --------------------------------------------------------------------------
+# inspect (used-car check) and OBDb signalsets
+# --------------------------------------------------------------------------
+
+def _signalsets(args):
+    """[(signalset, source)] and [error text] for --make/--model/--make-wide/--signalset."""
+    from . import obdb
+    wanted = []
+    if args.make:
+        if args.model:
+            wanted.append((args.make, args.model))
+        if args.make_wide or not args.model:
+            wanted.append((args.make, None))
+    specs, errors = [], []
+    for path in args.signalset or []:
+        try:
+            specs.append(obdb.load(path))
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"signalset {path}: {e}")
+    for make, model in wanted:
+        name = obdb.repo_name(make, model)
+        path = obdb.cached(make, model)
+        if not path and not args.no_fetch:
+            try:
+                path = obdb.fetch(make, model)
+                print(f"fetched OBDb/{path.parent.name}")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"OBDb {name}: could not fetch ({e}). Run `obd2log pids fetch {make}"
+                              f"{' ' + model if model else ''}` while online.")
+                continue
+        if not path:
+            errors.append(f"OBDb {name}: not in the cache and --no-fetch given")
+            continue
+        specs.append(obdb.load(path))
+    return specs, errors
+
+
+def cmd_inspect(args):
+    from . import inspection
+    specs, errors = _signalsets(args)   # fetch before connecting: the network may be gone at the car
+    car = _connect_or_exit(args)
+    print("reading everything the car will report; this takes a minute or two...")
+    try:
+        data = inspection.run(car, specs, args.year, args.all_years, errors)
+    finally:
+        car.close()
+    md = inspection.render(data, show_vin=car.vin if args.show_vin else None)
+    print(md)
+    if args.save != "-":
+        files = inspection.save(data, inspection.render(data), args.save, pdf=not args.no_pdf)
+        print("saved " + ", ".join(str(f) for f in files))
+
+
+def cmd_pids(args):
+    from . import obdb
+    if args.pcmd == "fetch":
+        path = obdb.fetch(args.make, args.model)
+        sigset, src = obdb.load(path)
+        n = sum(len(c["signals"]) for c in sigset["commands"])
+        print(f"{src['repo']} @ {src['commit'][:12]}: {len(sigset['commands'])} requests, {n} signals -> {path}")
+    elif args.pcmd == "search":
+        print("\n".join(obdb.search(args.text)) or "no matches")
+    elif args.pcmd == "list":
+        found = sorted(obdb.CACHE.glob("*/source.json")) if obdb.CACHE.exists() else []
+        for f in found:
+            src = json.loads(f.read_text())
+            print(f"{src['repo']:32} {src['commit'][:12]}  fetched {src['fetched']}")
+        if not found:
+            print(f"nothing cached in {obdb.CACHE}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--port", help="serial port (default: auto-detect, e.g. /dev/ttyUSB0)")
@@ -703,6 +809,30 @@ def main():
     s = sub.add_parser("monitors", help="mode 06 self-test results (misfire counts per cylinder, etc.)")
     s.add_argument("--save", help=save_help)
     s.set_defaults(fn=cmd_monitors)
+    s = sub.add_parser("inspect", help="used-car check: read everything (standard + --make/--model) into a report")
+    s.add_argument("--make", help="e.g. ford: adds OBDb manufacturer-specific requests")
+    s.add_argument("--model", help="e.g. escape: uses the OBDb <Make>-<Model> signalset (else the make-wide one)")
+    s.add_argument("--year", type=int, help="model year for OBDb year filters (default: from the VIN)")
+    s.add_argument("--make-wide", action="store_true",
+                   help="with --model, also send the make-wide OBDb set (every model's requests, all debug)")
+    s.add_argument("--signalset", action="append", help="a local OBDb-format JSON file (repeatable)")
+    s.add_argument("--all-years", action="store_true", help="also send requests OBDb lists for other model years")
+    s.add_argument("--no-fetch", action="store_true", help="only use cached OBDb signalsets")
+    s.add_argument("--show-vin", action="store_true", help="print the full VIN on screen (files stay masked)")
+    s.add_argument("--save", help="report directory; default: the vehicle's inspections/<YYYY>/<stamp>_inspect/; '-' = don't save")
+    s.add_argument("--no-pdf", action="store_true", help="skip report.pdf")
+    s.set_defaults(fn=cmd_inspect)
+    s = sub.add_parser("pids", help="OBDb manufacturer-specific signalsets (github.com/OBDb)")
+    ps = s.add_subparsers(dest="pcmd", required=True)
+    s = ps.add_parser("fetch", help="download a signalset into the cache (do this while online)")
+    s.add_argument("make")
+    s.add_argument("model", nargs="?")
+    s.set_defaults(fn=cmd_pids)
+    s = ps.add_parser("search", help="find OBDb repos, e.g. `pids search escape`")
+    s.add_argument("text")
+    s.set_defaults(fn=cmd_pids)
+    s = ps.add_parser("list", help="show cached signalsets")
+    s.set_defaults(fn=cmd_pids)
     s = sub.add_parser("log")
     s.add_argument("--interval", type=float, default=1.0, help="seconds between samples")
     s.add_argument("--dtc-every", type=float, default=30.0, help="seconds between code checks")
