@@ -246,8 +246,9 @@ def markdown_pdf(md_text, pdf, title):
     """Markdown -> HTML (kept next to the PDF) -> PDF, in the case-report style."""
     import markdown
     body = markdown.markdown(md_text, extensions=["tables"])
+    css = CSS + "img { width: auto; max-width: 100%; max-height: 135mm; display: block; margin: 0 auto; }"
     page = (f"<!doctype html><html><head><meta charset=utf-8><title>{html.escape(title)}</title>"
-            f"<style>{CSS}</style></head><body>{body}</body></html>")
+            f"<style>{css}</style></head><body>{body}</body></html>")
     h = Path(pdf).with_suffix(".html")
     h.write_text(page)
     return html_pdf(h, pdf)
